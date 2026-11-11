@@ -177,9 +177,9 @@ those rendering dimensions remain open until isolated by the native oracle.
 | `<+C>` | no payload | Justified alignment | confirmed, `SAM-INLINE-STYLE-001` |
 | `<:f>` | no payload | Proposed restore of character state from the current paragraph style | tentative semantics; native behavior open, `SAM-INLINE-FONT-RESET-001` |
 | `<:fSIZE>` | signed bounded twips | Set font size; omitted-property inheritance remains to be isolated | grammar confirmed; meaning strong; reset details tentative, `SAM-INLINE-FONT-001`, `SAM-INLINE-FONT-RESET-001` |
-| `<:fSIZE,FAMILY>` | size and escaped family | Set size/family; leading family discriminator digits are metadata rather than family text | grammar confirmed; meaning strong; native metrics open, `SAM-INLINE-FONT-001` |
-| `<:fSIZE,FAMILY,R,G,B>` | RGB channels bounded/clamped to 0–255 | Set size, family, and color | grammar confirmed; meaning strong; native appearance open, `SAM-INLINE-FONT-001` |
-| `<:fSIZE,FAMILY,>` | compact observed form | Apply present size/family; proposed restoration of default color | grammar confirmed; reset semantics tentative, `SAM-INLINE-FONT-001`, `SAM-INLINE-FONT-RESET-001` |
+| `<:fSIZE,KFACE>` | size and escaped family: prefix K then face | Set size/family; K, the first raw token, is a pitch-and-family prefix and is not family text (`SAM-INLINE-FONT-PREFIX-001`) | grammar confirmed; meaning strong; native metrics open, `SAM-INLINE-FONT-001` |
+| `<:fSIZE,KFACE,R,G,B>` | RGB channels bounded/clamped to 0–255 | Set size, family, and color | grammar confirmed; meaning strong; native appearance open, `SAM-INLINE-FONT-001` |
+| `<:fSIZE,KFACE,>` | compact observed form | Apply present size/family; proposed restoration of default color | grammar confirmed; reset semantics tentative, `SAM-INLINE-FONT-001`, `SAM-INLINE-FONT-RESET-001` |
 | `<:S+-1>` / `-2` / `-3` | three sentinel values | Single / 1.5 / double line spacing | grammar confirmed; meaning strong; exact native spacing open, `SAM-INLINE-SPACING-001` |
 | `<:S+N>` | bounded finite numeric value | Other spacing quantity; retain exact value and avoid stronger unit claims | syntax confirmed, semantics tentative, `SAM-INLINE-SPACING-001` |
 | `<:S->` | no payload | Restore current style line spacing | grammar confirmed; meaning strong; exact native spacing open, `SAM-INLINE-SPACING-001` |
