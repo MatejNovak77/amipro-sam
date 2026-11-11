@@ -30,6 +30,7 @@ from .model import (
     Image,
     Lossiness,
     OpaquePageHints,
+    PageBreak,
     PageLayout,
     PageVariantGeometry,
     Paragraph,
@@ -220,6 +221,8 @@ class _InlineState:
     region_width_twips: int | None = None
     inline_indent_twips: tuple[int, int, int, int] | None = None
     page_break_before: bool = False
+    page_break_after: bool = False
+    page_break_requested: bool = False
     unknown_tags: list[str] = field(default_factory=list)
     unapplied_tags: list[str] = field(default_factory=list)
     open_dynamic_fields: list[str] = field(default_factory=list)
@@ -3630,11 +3633,28 @@ def _parse_text_stream(
     def count_record(count: int = 1) -> None:
         active_record_budget.charge(count, f"{stream_label} content records")
 
-    def append_text_blocks(lines: list[str], source: SourceSpan, target: list[Block]) -> None:
+    def append_text_blocks(
+        lines: list[str],
+        source: SourceSpan,
+        target: list[Block],
+        *,
+        trailing_page_breaks: bool = False,
+    ) -> None:
         if not lines:
             return
         text = "\n".join(lines)
         state = _initial_inline_state(document)
+
+        def append_paragraph(paragraph: Paragraph) -> None:
+            if paragraph.text or paragraph.runs:
+                target.append(paragraph)
+            elif trailing_page_breaks and paragraph.page_break_before:
+                # A break alone in an otherwise empty paragraph must not vanish.
+                target.append(PageBreak(source))
+                state.page_break_before = False
+            if trailing_page_breaks and state.page_break_after:
+                target.append(PageBreak(source))
+                state.page_break_after = False
         cursor = 0
         for match in _FRAME_ANCHOR.finditer(text):
             prefix = text[cursor : match.start()]
@@ -3647,9 +3667,9 @@ def _parse_text_stream(
                     state=state,
                     record_budget=active_record_budget,
                     record_label=f"{stream_label} inline runs",
+                    trailing_page_breaks=trailing_page_breaks,
                 )
-                if paragraph.text or paragraph.runs:
-                    target.append(paragraph)
+                append_paragraph(paragraph)
             count_record()
             resolved = _resolve_frame_anchor(
                 document,
@@ -3673,13 +3693,15 @@ def _parse_text_stream(
                 state=state,
                 record_budget=active_record_budget,
                 record_label=f"{stream_label} inline runs",
+                trailing_page_breaks=trailing_page_breaks,
             )
-            if paragraph.text or paragraph.runs:
-                target.append(paragraph)
+            append_paragraph(paragraph)
 
     def flush_top() -> None:
         nonlocal top_lines
-        append_text_blocks(top_lines, top_source, root_blocks)
+        append_text_blocks(
+            top_lines, top_source, root_blocks, trailing_page_breaks=output_blocks is None
+        )
         top_lines = []
 
     def flush_container(state: _OpenContainer) -> None:
@@ -4031,6 +4053,7 @@ def _parse_inline_paragraph(
     state: _InlineState | None = None,
     record_budget: _RecordBudget | None = None,
     record_label: str = "inline runs",
+    trailing_page_breaks: bool = False,
 ) -> Paragraph:
     # SAM uses a blank physical line as the paragraph delimiter.  Nonblank
     # physical lines inside that record are storage continuations and may even
@@ -4045,6 +4068,12 @@ def _parse_inline_paragraph(
     inline_commands_omitted = False
     undefined_style_count = 0
     undefined_styles: set[str] = set()
+    boundary_fallbacks = 0
+    visible_at_break: int | None = None
+
+    def visible_count() -> int:
+        emitted = "".join(run.text for run in paragraph.runs) + "".join(pending_chunks)
+        return sum(1 for character in emitted if not character.isspace())
 
     def finish_run() -> None:
         nonlocal pending_style, pending_chunks
@@ -4115,12 +4144,23 @@ def _parse_inline_paragraph(
                 buffer.append(character)
                 index += consumed
                 continue
-            end = text.find(">", index + 1)
+            end, fell_back = _find_inline_command_close(text, index)
             if end >= 0:
+                boundary_fallbacks += fell_back
                 flush()
                 tag = text[index + 1 : end]
                 if allow_inline_command():
+                    break_before = state.page_break_before
+                    state.page_break_requested = False
                     visible = _apply_inline_tag(tag, state, document, source)
+                    if state.page_break_requested and trailing_page_breaks:
+                        count = visible_count()
+                        if count:
+                            # The text after the command starts the next page
+                            # (SAM-INLINE-PAGEBREAK-002), so break after this paragraph.
+                            state.page_break_before = break_before
+                            state.page_break_after = True
+                            visible_at_break = count
                     if visible:
                         buffer.append(visible)
                 index = end + 1
@@ -4232,6 +4272,29 @@ def _parse_inline_paragraph(
                 "inline-command limit; surrounding text and one visible marker "
                 "were retained",
                 source,
+            )
+        )
+    if boundary_fallbacks:
+        document.diagnostics.append(
+            Diagnostic(
+                Severity.WARNING,
+                "inline-command-boundary-fallback",
+                f"{boundary_fallbacks} inline command(s) with nested escapes had no "
+                f"close within {_MAX_NESTED_INLINE_COMMAND_CHARS} characters; the first "
+                "'>' was used",
+                source,
+                lossiness=Lossiness.SEMANTIC,
+            )
+        )
+    if visible_at_break is not None and visible_count() > visible_at_break:
+        document.diagnostics.append(
+            Diagnostic(
+                Severity.WARNING,
+                "page-break-mid-paragraph-approximated",
+                "a page break with text after it in the same paragraph was placed after "
+                "the whole paragraph",
+                source,
+                lossiness=Lossiness.SEMANTIC,
             )
         )
     if paragraph.text or paragraph.runs:
@@ -4393,11 +4456,18 @@ def _apply_inline_tag(
         return None
     if tag == ":p":
         state.page_break_before = True
+        state.page_break_requested = True
         return None
     if tag.startswith(":p"):
         state.page_break_before = True
-        state.unknown_tags.append(tag[:200])
-        return _unsupported_inline_marker(tag)
+        parsed = _page_break_flag(tag)
+        if parsed is None:
+            state.unknown_tags.append(tag[:200])
+            return _unsupported_inline_marker(tag)
+        state.page_break_requested = True
+        if parsed[0] != 0:
+            state.unapplied_tags.append(tag[:200])
+        return None
     if tag.startswith(":t"):
         state.unknown_tags.append(tag[:200])
         return _unsupported_inline_marker(tag)
@@ -4455,6 +4525,71 @@ def _escape_character(kind: str, operand: str) -> str | None:
     value = (ord(operand) + 0x40) & 0xFF if kind == "/" else ord(operand) | 0x80
     codec = _ESCAPE_CODEC.get() or _EscapeCodec()
     return codec.character(value)
+
+
+_MAX_NESTED_INLINE_COMMAND_CHARS = 512
+_PAGE_BREAK_FORM = re.compile(r"^:p(<\*.>|</.>|<\\.>|[^<>])(.*)$", re.DOTALL)
+
+
+def _find_inline_command_close(text: str, index: int) -> tuple[int, bool]:
+    """Return the `>` closing the command opened at *index* and whether it fell back.
+
+    Complete escape tokens inside a payload do not close the command
+    (SAM-INLINE-NESTING-001). Without a `<` before the first `>` the split is the
+    historical first-`>` split. A bare `<` keeps that split silently; a bounded scan
+    that already skipped a `>`-terminated token and finds no close falls back to it
+    and reports the fallback.
+    """
+
+    legacy = text.find(">", index + 1)
+    if legacy < 0 or text.find("<", index + 1, legacy) < 0:
+        return legacy, False
+    limit = index + 1 + _MAX_NESTED_INLINE_COMMAND_CHARS
+    position = index + 1
+    skipped_close = False
+    while position < len(text) and position <= limit:
+        character = text[position]
+        if character == ">":
+            return position, False
+        if character == "<":
+            if text.startswith("<<", position):
+                position += 2
+                continue
+            if text.startswith("<;>", position) or text.startswith("<[>", position):
+                position += 3
+                skipped_close = True
+                continue
+            if (
+                position + 3 < len(text)
+                and text[position + 1] in "\\/*"
+                and text[position + 3] == ">"
+            ):
+                position += 4
+                skipped_close = True
+                continue
+            return legacy, False
+        position += 1
+    return legacy, skipped_close
+
+
+def _page_break_flag(tag: str) -> tuple[int, str] | None:
+    """Decode `:pFLAG[NAME]` (SAM-INLINE-PAGEBREAK-001); None when malformed."""
+
+    match = _PAGE_BREAK_FORM.match(tag)
+    if match is None:
+        return None
+    token, name = match.group(1), match.group(2)
+    if len(token) == 1:
+        flag = ord(token)
+    elif token[1] == "*":
+        flag = (ord(token[2]) - 0x20) & 0xFF
+    elif token[1] == "/":
+        flag = (ord(token[2]) + 0x40) & 0xFF
+    else:
+        flag = ord(token[2]) | 0x80
+    if flag > 0xFF or bool(name) != bool(flag & 0x80) or len(name) > 256:
+        return None
+    return flag, name
 
 
 def _decode_special_escape(text: str, index: int) -> tuple[str, int] | None:

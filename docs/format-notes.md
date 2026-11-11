@@ -379,7 +379,11 @@ furniture selection.
 commands are version-dependent and not publicly mapped at byte level. `[pg]`
 is retained as `OpaquePageHints`; it never supplies a trusted page count,
 allocation size, or inferred layout transition. A confirmed `<:p...>` command
-still requests a visible page break before the following paragraph.
+still requests a visible page break: `<:p` takes one flag byte, raw or escaped
+(`<:p<* >>` is flag 0, `@` is 64 for vertical centring, `</@>` + a layout name is
+128), and the text after the command starts the next page
+(`SAM-INLINE-PAGEBREAK-001`/`-002`). Escape tokens inside a command payload do not
+close it (`SAM-INLINE-NESTING-001`).
 
 Tables use `[tbl]`, optional `[h]` row and `[w]` column definitions, then
 `[data]` cell records. The private corpus consistently uses exact 9-, 7-, 5-,
