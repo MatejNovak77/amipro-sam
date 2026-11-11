@@ -77,7 +77,9 @@ def test_invalid_four_field_indent_cannot_partially_mutate_state() -> None:
     assert any(item.code == "unsupported-inline-tags" for item in document.diagnostics)
 
 
-@pytest.mark.parametrize("tag", [b":f240,Wingdings,", b":f,,"])
+# Ami Pro writes every <:f family with a pitch-and-family prefix character
+# (SAM-INLINE-FONT-PREFIX-001); the space prefix matches docs/plans/corpus-fidelity-plan.md.
+@pytest.mark.parametrize("tag", [b":f240, Wingdings,", b":f,,"])
 def test_compact_font_command_has_an_empty_optional_color_tail(tag: bytes) -> None:
     document, paragraph = _paragraph(b"BEFORE<" + tag + b">AFTER", strict=True)
 
@@ -91,7 +93,7 @@ def test_compact_font_command_has_an_empty_optional_color_tail(tag: bytes) -> No
 
 def test_compact_font_omissions_restore_paragraph_font_defaults() -> None:
     document, paragraph = _paragraph(
-        b"<:f300,Arial,255,0,0>OVERRIDE<:f240,Wingdings,>FAMILY<:f,,>DEFAULT"
+        b"<:f300,BArial,255,0,0>OVERRIDE<:f240, Wingdings,>FAMILY<:f,,>DEFAULT"
     )
 
     family = next(run for run in paragraph.runs if run.text == "FAMILY")

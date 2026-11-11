@@ -237,7 +237,7 @@ fourth field. That establishes a canonical shape, not the meanings of the first
 three values. They are therefore retained atomically in typed IR and diagnosed
 as unapplied semantics without a body marker; malformed variants remain visible
 and cannot partially mutate paragraph state. Compact font forms such as
-`<:f240,Wingdings,>` apply their present size/family fields with an empty color
+`<:f240, Wingdings,>` (space = pitch-and-family prefix) apply their present size/family fields with an empty color
 tail. A matched `:X~...` field close is nonprinting after the opener has already
 produced its inert fallback; unmatched closes remain explicit.
 

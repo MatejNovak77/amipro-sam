@@ -77,6 +77,12 @@ _LINE_SPACING = re.compile(r"^:S\+(?P<value>-?\d+(?:\.\d+)?)$", re.IGNORECASE)
 _PARAGRAPH_LAYOUT = re.compile(r"^:#(?P<first>-?\d+)(?:,(?P<rest>-?\d+))?$")
 _FRAME_ANCHOR = re.compile(r"(?<!<)<:(?P<kind>t|A)(?P<index>\d+)>")
 _MAX_INLINE_COMMANDS_PER_PARAGRAPH = 4_095
+# Observed pitch-and-family prefix characters (SAM-INLINE-FONT-PREFIX-001): Windows
+# LOGFONT pitch (0-2) plus family (0x00-0x50) plus 0x20. Advisory only, not a whitelist.
+_PITCH_AND_FAMILY_PREFIXES = frozenset(
+    chr(0x20 + family + pitch) for family in range(0x00, 0x60, 0x10) for pitch in range(3)
+)
+_FONT_PREFIX_ESCAPE = re.compile(r"^<(?:[\\/*].|;|\[)>")
 _MAX_OPAQUE_TABLE_FIELD_ENTRIES = 256
 _MAX_OPAQUE_TABLE_FIELD_CHARS = 16_384
 _LAYOUT_TABBED_MARKER = re.compile(
@@ -228,6 +234,7 @@ class _InlineState:
     page_break_after: bool = False
     page_break_requested: bool = False
     page_number_run: PageNumberRun | None = None
+    unrecognized_font_prefixes: list[str] = field(default_factory=list)
     unknown_tags: list[str] = field(default_factory=list)
     unapplied_tags: list[str] = field(default_factory=list)
     open_dynamic_fields: list[str] = field(default_factory=list)
@@ -4265,6 +4272,20 @@ def _parse_inline_paragraph(
             )
         )
         state.unapplied_tags.clear()
+    if state.unrecognized_font_prefixes:
+        prefixes = sorted(set(state.unrecognized_font_prefixes))
+        document.diagnostics.append(
+            Diagnostic(
+                Severity.INFO,
+                "inline-font-prefix-unrecognized",
+                f"{len(state.unrecognized_font_prefixes)} font family prefix character(s) "
+                "outside the observed pitch-and-family set were dropped as prefixes",
+                source,
+                " ".join(repr(prefix) for prefix in prefixes[:16]),
+                lossiness=Lossiness.NONE,
+            )
+        )
+        state.unrecognized_font_prefixes.clear()
     if undefined_style_count:
         document.diagnostics.append(
             Diagnostic(
@@ -4395,9 +4416,13 @@ def _apply_inline_tag(
             state.unknown_tags.append(tag[:200])
             return _unsupported_inline_marker(tag)
         family: str | None = None
+        unrecognized_prefix: str | None = None
         if len(fields) > 1 and fields[1]:
-            family = re.sub(r"^\d", "", _unescape_literal(fields[1]))
-            if len(family) > 256:
+            prefix, face = _split_font_prefix(fields[1])
+            if prefix not in _PITCH_AND_FAMILY_PREFIXES:
+                unrecognized_prefix = prefix
+            family = _unescape_literal(face) or None
+            if family is not None and len(family) > 256:
                 state.unknown_tags.append(tag[:200])
                 return _unsupported_inline_marker(tag)
         channels: list[int] | None = None
@@ -4426,6 +4451,8 @@ def _apply_inline_tag(
             else default_character.color
         )
         state.style = replacement
+        if unrecognized_prefix is not None:
+            state.unrecognized_font_prefixes.append(unrecognized_prefix)
         return None
     if match := _PARAGRAPH_LAYOUT.match(tag):
         raw_x = match.group("first")
@@ -4628,6 +4655,29 @@ def _page_break_flag(tag: str) -> tuple[int, str] | None:
     if flag > 0xFF or bool(name) != bool(flag & 0x80) or len(name) > 256:
         return None
     return flag, name
+
+
+def _split_font_prefix(field_text: str) -> tuple[str, str]:
+    """Split a raw `<:f` family field into (decoded prefix character, raw face).
+
+    The prefix is the first raw token: one literal character, or one complete escape
+    token consumed whole (SAM-INLINE-FONT-PREFIX-001). The face stays raw for
+    `_unescape_literal`, so `@@` is never collapsed across the prefix boundary.
+    """
+
+    match = _FONT_PREFIX_ESCAPE.match(field_text)
+    if match is None:
+        return field_text[0], field_text[1:]
+    token = match.group(0)
+    if token == "<;>":
+        prefix = ">"
+    elif token == "<[>":
+        prefix = "["
+    elif token[1] == "*":
+        prefix = chr((ord(token[2]) - 0x20) & 0xFF)
+    else:
+        prefix = _escape_character(token[1], token[2]) or token
+    return prefix, field_text[len(token) :]
 
 
 def _decode_special_escape(text: str, index: int) -> tuple[str, int] | None:
