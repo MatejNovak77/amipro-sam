@@ -197,7 +197,8 @@ those rendering dimensions remain open until isolated by the native oracle.
 | `<:If0,f1,f2,f3>` | exactly four bounded integers in the established shape | Preserve one atomic indentation/layout tuple; do not partially apply unconfirmed fields | strong syntax, semantics open, `SAM-INLINE-INDENT-001` |
 | `<:tN>` / `<:AN>` | nonnegative frame index | Associate the text position with an indexed anchor-eligible frame; preserve unresolved/out-of-range anchors | strong, `SAM-FRAME-001` |
 | `<:D...>` | observed variants | Dynamic/current date placeholder; do not evaluate as source text | tentative meaning; exact variants open, `SAM-INLINE-DYNAMIC-001` |
-| `<:P...>` | observed variants | Dynamic page-number placeholder; render only where target context safely supports it | tentative meaning; exact variants open, `SAM-INLINE-DYNAMIC-001` |
+| `<:PSP,N,LEAD>` | style `1 I i A a`, start page P, start number N, leading text | Page-number field: on physical page p show nothing before P; with N > 0 show p − P + N (p + N − 1 when P is 0); otherwise p; preceded by LEAD in style S. Paginated outputs show the real number; text outputs show LEAD + `[#]` | grammar confirmed; order and value strong, `SAM-INLINE-PAGENUM-001`–`004` |
+| `<:P...>` | other payload | Retain as an unsupported variant | open, `SAM-INLINE-DYNAMIC-001` |
 | `<:X...>` | quoted/delimited dynamic field expression | Never execute. Preserve expression; a reader MAY expose inert fallback/merge-field text | syntax strong, payload semantics open, `SAM-INLINE-DYNAMIC-001` |
 | `<:X~...>` | matching dynamic-field close | Close only the matching open field; unmatched forms remain explicit | syntax strong, semantics open, `SAM-INLINE-DYNAMIC-001` |
 | `<:Z...>` / `<:Z~...>` | observed dynamic/revision family | Preserve without execution or inferred effect | syntax strong, semantics open, `SAM-INLINE-DYNAMIC-001` |
