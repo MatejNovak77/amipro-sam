@@ -39,6 +39,7 @@ from ..model import (
     _TextOutputBudget,
     document_page_number_restart,
 )
+from ..raster import RasterDecodeError, image_display_size, image_png
 from ..sdw import SdwDecodeError, sdw_display_size, sdw_png, sdw_preview_caption
 from ..wmf import WmfDecodeError, wmf_display_size, wmf_png
 from .paragraph_geometry import resolve_paragraph_region
@@ -510,6 +511,19 @@ class _ContentBuilder:
             self.body_text.insert(0, first)
         is_table = first.tag == _q("table", "table")
         style_name = first.get(_q("table" if is_table else "text", "style-name"))
+        if style_name is None:
+            # Unstyled first element (e.g. a WMF preview paragraph): give it a style.
+            self._paragraph_style_counter += 1
+            style_name = f"P{self._paragraph_style_counter}"
+            ET.SubElement(
+                self.automatic_styles,
+                _q("style", "style"),
+                {
+                    _q("style", "name"): style_name,
+                    _q("style", "family"): "table" if is_table else "paragraph",
+                },
+            )
+            first.set(_q("table" if is_table else "text", "style-name"), style_name)
         style = next(
             (
                 node
@@ -622,7 +636,10 @@ class _ContentBuilder:
                 elif isinstance(block, Table):
                     self._add_table(block)
                 elif isinstance(block, Image):
-                    self._add_placeholder(_image_placeholder(block))
+                    if _is_png_image(block):
+                        self._add_image(block)
+                    else:
+                        self._add_placeholder(_image_placeholder(block))
                 elif isinstance(block, WmfGraphic):
                     self._add_wmf(block)
                 elif isinstance(block, SdwDrawing):
@@ -673,6 +690,55 @@ class _ContentBuilder:
             # well as direct cycles; repeated content receives the visible
             # marker at the entry check above.
             pass
+
+    def _add_image(self, image: Image) -> None:
+        """Embed a caller-supplied canonical PNG as a fresh re-encoding."""
+
+        try:
+            payload = image_png(image)
+            width, height = image_display_size(
+                image,
+                max_width_in=min(6.25, self.geometry.body_width_twips / 1440),
+                max_height_in=min(7.5, self.geometry.body_height_twips / 1440),
+            )
+        except RasterDecodeError as exc:
+            self._add_placeholder(_image_placeholder(image, reason=exc.code))
+            return
+        self._image_counter += 1
+        name = f"Pictures/Image{self._image_counter}.png"
+        self.generated_images.append((name, payload))
+        # A one-use automatic style, so a page-number restart can bind to an image-first
+        # document (master-page binding needs the first paragraph's own style).
+        self._paragraph_style_counter += 1
+        style_name = f"P{self._paragraph_style_counter}"
+        ET.SubElement(
+            self.automatic_styles,
+            _q("style", "style"),
+            {_q("style", "name"): style_name, _q("style", "family"): "paragraph"},
+        )
+        paragraph = ET.SubElement(
+            self.body_text, _q("text", "p"), {_q("text", "style-name"): style_name}
+        )
+        frame = ET.SubElement(
+            paragraph,
+            _q("draw", "frame"),
+            {
+                _q("draw", "name"): f"Image{self._image_counter}",
+                _q("text", "anchor-type"): "as-char",
+                _q("svg", "width"): f"{width:.6g}in",
+                _q("svg", "height"): f"{height:.6g}in",
+            },
+        )
+        ET.SubElement(
+            frame,
+            _q("draw", "image"),
+            {
+                _q("xlink", "href"): name,
+                _q("xlink", "type"): "simple",
+                _q("xlink", "show"): "embed",
+                _q("xlink", "actuate"): "onLoad",
+            },
+        )
 
     def _add_wmf(self, graphic: WmfGraphic) -> None:
         try:
@@ -1579,7 +1645,17 @@ def _is_xml_character(codepoint: int) -> bool:
     )
 
 
-def _image_placeholder(image: Image) -> str:
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _is_png_image(image: Image) -> bool:
+    return isinstance(image.data, bytes) and image.data.startswith(_PNG_SIGNATURE)
+
+
+def _image_placeholder(image: Image, reason: str | None = None) -> str:
+    if reason is not None:
+        alt = _safe_label_field(image.alt_text, "Embedded image", maximum=256)
+        return f"[Image: {alt} (PNG not rendered: {reason})]"
     alt = _safe_label_field(image.alt_text, "Embedded image", maximum=256)
     detail = f"Image: {alt}"
     if image.reference:

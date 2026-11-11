@@ -40,6 +40,7 @@ from ..model import (
     document_page_number_restart,
 )
 from ..model import Document as AmiProDocument
+from ..raster import RasterDecodeError, image_display_size, image_png
 from ..sdw import SdwDecodeError, sdw_display_size, sdw_png, sdw_preview_caption
 from ..wmf import WmfDecodeError, wmf_display_size, wmf_png
 from .paragraph_geometry import resolve_paragraph_region
@@ -466,7 +467,10 @@ def _add_blocks(
                     text_budget,
                 )
             elif isinstance(block, Image):
-                _add_placeholder(target, _image_placeholder(block))
+                if _is_png_image(block):
+                    _add_image(target, block, geometry)
+                else:
+                    _add_placeholder(target, _image_placeholder(block))
             elif isinstance(block, WmfGraphic):
                 _add_wmf(target, block, geometry)
             elif isinstance(block, SdwDrawing):
@@ -683,6 +687,28 @@ def _container_label(block: Annotation | Footnote | Header | Footer) -> str:
         "unknown": "placement unknown",
     }.get(source_placement, "placement unknown")
     return f"[{kind}: {placement}]"
+
+
+def _add_image(target: Any, image: Image, geometry: _PageGeometry) -> None:
+    """Embed a caller-supplied canonical PNG as a fresh re-encoding."""
+
+    from docx.shared import Inches
+
+    try:
+        payload = image_png(image)
+        width, height = image_display_size(
+            image,
+            max_width_in=min(6.25, geometry.body_width_twips / 1440),
+            max_height_in=min(7.5, geometry.body_height_twips / 1440),
+        )
+    except RasterDecodeError as exc:
+        _add_placeholder(target, _image_placeholder(image, reason=exc.code))
+        return
+    paragraph = target.add_paragraph()
+    paragraph.add_run(
+        _clean_xml_text(_safe_label_field(image.alt_text, "Embedded image", maximum=256))
+    )
+    paragraph.add_run().add_picture(BytesIO(payload), width=Inches(width), height=Inches(height))
 
 
 def _add_wmf(target: Any, graphic: WmfGraphic, geometry: _PageGeometry) -> None:
@@ -1448,7 +1474,17 @@ def _resolved_style(
     return resolved
 
 
-def _image_placeholder(image: Image) -> str:
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _is_png_image(image: Image) -> bool:
+    return isinstance(image.data, bytes) and image.data.startswith(_PNG_SIGNATURE)
+
+
+def _image_placeholder(image: Image, reason: str | None = None) -> str:
+    if reason is not None:
+        alt = _safe_label_field(image.alt_text, "Embedded image", maximum=256)
+        return f"[Image: {alt} (PNG not rendered: {reason})]"
     alt = _safe_label_field(image.alt_text, "Embedded image", maximum=256)
     detail = f"Image: {alt}"
     if image.reference:

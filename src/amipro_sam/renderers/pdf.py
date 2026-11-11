@@ -84,6 +84,7 @@ from ..model import (
     WmfGraphic,
     page_number_text,
 )
+from ..raster import RasterDecodeError, image_display_size, image_png
 from ..sdw import SdwDecodeError, sdw_display_size, sdw_png, sdw_preview_caption
 from ..wmf import WmfDecodeError, wmf_display_size, wmf_png
 from .paragraph_geometry import resolve_paragraph_region
@@ -347,7 +348,10 @@ def _append_primary_blocks(
             story.append(_table_flowable(document, block, text_budget))
             list_counters.clear()
         elif isinstance(block, Image):
-            story.append(_placeholder_flowable(_image_placeholder(block), text_budget))
+            if _is_png_image(block):
+                story.append(_image_flowable(block, document, text_budget))
+            else:
+                story.append(_placeholder_flowable(_image_placeholder(block), text_budget))
             list_counters.clear()
         elif isinstance(block, WmfGraphic):
             story.append(_wmf_flowable(block, document, text_budget))
@@ -534,13 +538,16 @@ def _append_fallback_blocks(
             list_counters.clear()
             story.append(_fallback_table_flowable(block, document, text_budget))
         elif isinstance(block, Image):
-            story.append(
-                _fallback_paragraph(
-                    _image_placeholder(block),
-                    placeholder=True,
-                    text_budget=text_budget,
+            if _is_png_image(block):
+                story.append(_image_flowable(block, document, text_budget))
+            else:
+                story.append(
+                    _fallback_paragraph(
+                        _image_placeholder(block),
+                        placeholder=True,
+                        text_budget=text_budget,
+                    )
                 )
-            )
             list_counters.clear()
         elif isinstance(block, WmfGraphic):
             story.append(_wmf_flowable(block, document, text_budget))
@@ -1889,9 +1896,38 @@ def _font_name(style: CharacterStyle) -> str:
     )
 
 
-def _image_placeholder(image: Image) -> str:
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _is_png_image(image: Image) -> bool:
+    return isinstance(image.data, bytes) and image.data.startswith(_PNG_SIGNATURE)
+
+
+def _image_flowable(
+    image: Image, document: Document | None, text_budget: PdfTextBudget | None
+) -> object:
+    """Draw a caller-supplied canonical PNG; ReportLab only sees a fresh re-encoding."""
+
+    page = _page_spec(document) if isinstance(document, Document) else _PageSpec()
+    try:
+        payload = image_png(image)
+        width, height = image_display_size(
+            image,
+            max_width_in=max(1.0, page.body_width - 12.0) / inch,
+            max_height_in=max(1.0, page.body_height - 12.0) / inch,
+        )
+    except RasterDecodeError as exc:
+        return _placeholder_flowable(_image_placeholder(image, reason=exc.code), text_budget)
+    flowable = ReportLabImage(BytesIO(payload), width=width * inch, height=height * inch)
+    flowable.hAlign = "LEFT"
+    return flowable
+
+
+def _image_placeholder(image: Image, reason: str | None = None) -> str:
     alt = _safe_label_field(image.alt_text, "Embedded image", maximum=256)
     detail = f"Image: {alt}"
+    if reason is not None:
+        return f"[{detail} (PNG not rendered: {reason})]"
     if image.reference:
         reference = _safe_label_field(
             image.reference, "invalid reference omitted", maximum=256
