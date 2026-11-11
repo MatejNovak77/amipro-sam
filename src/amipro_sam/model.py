@@ -435,6 +435,7 @@ class Paragraph:
     # are not yet corroborated.  Preserve it atomically without applying a
     # guessed layout.
     inline_indent_twips: tuple[int, int, int, int] | None = None
+    record_span: SourceSpan | None = field(default=None, compare=False)
 
     @property
     def text(self) -> str:
@@ -444,6 +445,7 @@ class Paragraph:
 @dataclass(slots=True)
 class PageBreak:
     source: SourceSpan | None = None
+    record_span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -672,6 +674,8 @@ class UnsupportedObject:
     kind: str
     description: str
     source: SourceSpan | None = None
+    record_span: SourceSpan | None = field(default=None, compare=False)
+    anchor_source: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -703,6 +707,8 @@ class Frame:
     raw: str = ""
     source: SourceSpan | None = None
     name: str | None = None
+    record_span: SourceSpan | None = field(default=None, compare=False)
+    anchor_source: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -714,6 +720,7 @@ class Annotation:
     raw: str = ""
     terminated: bool = True
     source: SourceSpan | None = None
+    record_span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -730,6 +737,7 @@ class Footnote:
     terminated: bool = True
     number: int | None = None
     source: SourceSpan | None = None
+    record_span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -747,6 +755,7 @@ class Header:
     terminated: bool = True
     source: SourceSpan | None = None
     frame: Frame | None = None
+    record_span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -764,6 +773,7 @@ class Footer:
     terminated: bool = True
     source: SourceSpan | None = None
     frame: Frame | None = None
+    record_span: SourceSpan | None = field(default=None, compare=False)
 
 
 Block: TypeAlias = (

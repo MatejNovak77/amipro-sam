@@ -266,6 +266,8 @@ class _OpenContainer:
     blocks: list[Block] = field(default_factory=list)
     paragraph_lines: list[str] = field(default_factory=list)
     paragraph_source: SourceSpan | None = None
+    provenance_start: int | None = None
+    provenance_end: int | None = None
 
 
 @dataclass(slots=True)
@@ -3627,6 +3629,52 @@ def _frame_asset_id(section: SectionRecord) -> str | None:
     return None
 
 
+# Multi-byte codecs whose per-character encoding is stateless, so a line prefix's encoded
+# length is its byte length. Stateful codecs (UTF-7, ISO-2022, UTF-16/32) and codecs with
+# multi-character mappings (Big5-HKSCS) are excluded: their within-line offsets stay None.
+_STATELESS_PROVENANCE_CODECS = frozenset(
+    {"utf-8", "cp932", "shift_jis", "euc_jp", "gbk", "gb2312", "cp949", "euc_kr", "cp950", "big5"}
+)
+
+
+def _provenance_codec(encoding: str) -> str | None:
+    """The codec usable for exact within-line byte offsets, or None."""
+
+    try:
+        name = codecs.lookup(encoding).name
+    except LookupError:
+        return None
+    if name in _STATELESS_PROVENANCE_CODECS:
+        return name
+    _table, fallback = _escape_table(name)
+    return None if fallback else name
+
+
+def _line_byte_offset(
+    line: str, span: SourceSpan, char_index: int, codec: str | None
+) -> int | None:
+    """Byte offset of ``line[char_index]`` in the source, verified against the line span."""
+
+    if char_index == 0:
+        return span.byte_offset
+    if char_index == len(line):
+        return span.end_byte_offset
+    if codec is None:
+        return None
+    try:
+        if len(line.encode(codec)) != span.end_byte_offset - span.byte_offset:
+            return None
+        return span.byte_offset + len(line[:char_index].encode(codec))
+    except (UnicodeError, LookupError, ValueError):
+        return None
+
+
+def _span_between(first: SourceSpan, start: int | None, end: int | None) -> SourceSpan | None:
+    if start is None or end is None or end < start:
+        return None
+    return SourceSpan(first.line, first.column, start, end)
+
+
 def _parse_text_stream(
     document: Document,
     section: SectionRecord,
@@ -3642,6 +3690,11 @@ def _parse_text_stream(
     root_blocks = document.blocks if output_blocks is None else output_blocks
     top_lines: list[str] = []
     top_source = section.source
+    # Provenance (main stream only): one (line, span, start_char, end_char) per piece
+    # of the current top-level record, so record spans and anchor offsets are exact.
+    record_provenance = output_blocks is None
+    provenance_codec = _provenance_codec(document.encoding) if record_provenance else None
+    top_pieces: list[tuple[str, SourceSpan, int, int]] = []
     stack: list[_OpenContainer] = []
     saw_outer_terminator = False
     scanner = MultilineContainerScanner()
@@ -3662,11 +3715,32 @@ def _parse_text_stream(
         target: list[Block],
         *,
         trailing_page_breaks: bool = False,
+        pieces: list[tuple[str, SourceSpan, int, int]] | None = None,
     ) -> None:
         if not lines:
             return
         text = "\n".join(lines)
         state = _initial_inline_state(document)
+        piece_starts: list[int] = []
+        if pieces is not None:
+            position = 0
+            for line_text in lines:
+                piece_starts.append(position)
+                position += len(line_text) + 1
+
+        def anchor_span(start: int, end: int) -> SourceSpan | None:
+            if pieces is None or len(pieces) != len(lines):
+                return None
+            index = bisect_right(piece_starts, start) - 1
+            if index < 0 or bisect_right(piece_starts, end - 1) - 1 != index:
+                return None
+            line_text, line_span, start_char, _end_char = pieces[index]
+            offset = start_char + start - piece_starts[index]
+            return _span_between(
+                line_span,
+                _line_byte_offset(line_text, line_span, offset, provenance_codec),
+                _line_byte_offset(line_text, line_span, offset + end - start, provenance_codec),
+            )
 
         def append_paragraph(paragraph: Paragraph) -> None:
             if paragraph.text or paragraph.runs:
@@ -3704,6 +3778,11 @@ def _parse_text_stream(
             )
             if len(resolved) > 1:
                 count_record(len(resolved) - 1)
+            if pieces is not None:
+                occurrence = anchor_span(match.start(), match.end())
+                for block in resolved:
+                    if isinstance(block, Frame | UnsupportedObject):
+                        block.anchor_source = occurrence
             target.extend(resolved)
             cursor = match.end()
         suffix = text[cursor:]
@@ -3721,11 +3800,27 @@ def _parse_text_stream(
             append_paragraph(paragraph)
 
     def flush_top() -> None:
-        nonlocal top_lines
+        nonlocal top_lines, top_pieces
+        first_new = len(root_blocks)
         append_text_blocks(
-            top_lines, top_source, root_blocks, trailing_page_breaks=output_blocks is None
+            top_lines,
+            top_source,
+            root_blocks,
+            trailing_page_breaks=output_blocks is None,
+            pieces=top_pieces if record_provenance else None,
         )
+        if record_provenance and top_pieces and len(top_pieces) == len(top_lines):
+            first_line, first_span, first_char, _ = top_pieces[0]
+            last_line, last_span, _, last_char = top_pieces[-1]
+            span = _span_between(
+                first_span,
+                _line_byte_offset(first_line, first_span, first_char, provenance_codec),
+                _line_byte_offset(last_line, last_span, last_char, provenance_codec),
+            )
+            for block in root_blocks[first_new:]:
+                block.record_span = span
         top_lines = []
+        top_pieces = []
 
     def flush_container(state: _OpenContainer) -> None:
         append_text_blocks(
@@ -3749,6 +3844,10 @@ def _parse_text_stream(
         if stack:
             stack[-1].blocks.append(block)
         else:
+            if record_provenance:
+                block.record_span = _span_between(
+                    state.source, state.provenance_start, state.provenance_end
+                )
             root_blocks.append(block)
 
     for line, line_source in zip(section.raw_lines, section.raw_spans, strict=False):
@@ -3756,6 +3855,7 @@ def _parse_text_stream(
         if scan.standalone_terminator:
             if stack:
                 stack[-1].raw_lines.append(line)
+                stack[0].provenance_end = line_source.end_byte_offset
                 finish_container(terminated=True)
             else:
                 flush_top()
@@ -3793,6 +3893,7 @@ def _parse_text_stream(
                     if not top_lines:
                         top_source = line_source
                     top_lines.append(prefix)
+                    top_pieces.append((line, line_source, 0, opener.start()))
                 flush_top()
 
             if len(stack) >= limits.max_container_depth:
@@ -3813,19 +3914,24 @@ def _parse_text_stream(
                         line_source,
                     )
                 )
-            stack.append(
-                _OpenContainer(
-                    kind=kind,
-                    metadata=line[opener.end() :],
-                    source=line_source,
-                    raw_lines=[line[opener.start() :]],
-                )
+            opened = _OpenContainer(
+                kind=kind,
+                metadata=line[opener.end() :],
+                source=line_source,
+                raw_lines=[line[opener.start() :]],
             )
+            if record_provenance and not stack:
+                opened.provenance_start = _line_byte_offset(
+                    line, line_source, opener.start(), provenance_codec
+                )
+                opened.provenance_end = line_source.end_byte_offset
+            stack.append(opened)
             continue
 
         if stack:
             current = stack[-1]
             current.raw_lines.append(line)
+            stack[0].provenance_end = line_source.end_byte_offset
             if line:
                 if not current.paragraph_lines:
                     current.paragraph_source = line_source
@@ -3836,6 +3942,7 @@ def _parse_text_stream(
             if not top_lines:
                 top_source = line_source
             top_lines.append(line)
+            top_pieces.append((line, line_source, 0, len(line)))
         else:
             flush_top()
 
