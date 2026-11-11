@@ -6,6 +6,7 @@ links, macros, scripts, and externally referenced assets.
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from ..model import (
     Header,
     Image,
     PageBreak,
+    PageNumberRun,
     Paragraph,
     SdwDrawing,
     StyleDefinition,
@@ -35,6 +37,7 @@ from ..model import (
     WmfGraphic,
     _paragraph_text,
     _TextOutputBudget,
+    document_page_number_restart,
 )
 from ..sdw import SdwDecodeError, sdw_display_size, sdw_png, sdw_preview_caption
 from ..wmf import WmfDecodeError, wmf_display_size, wmf_png
@@ -330,10 +333,41 @@ def _append_native_paragraphs(
         if not isinstance(paragraph, Paragraph):
             continue
         node = ET.SubElement(parent, _q("text", "p"))
+        runs = getattr(paragraph, "runs", None)
+        if isinstance(runs, list | tuple) and any(
+            isinstance(run, PageNumberRun) for run in runs
+        ):
+            for run in runs[:1_024]:
+                if not isinstance(run, TextRun):
+                    continue
+                piece = run.leading_text if isinstance(run, PageNumberRun) else run.text
+                _append_text(
+                    node,
+                    _paragraph_text(
+                        Paragraph(runs=[TextRun(piece)]), text_budget, expansion_factor=5
+                    ),
+                )
+                if isinstance(run, PageNumberRun):
+                    _append_page_number_field(node, run)
+            continue
         _append_text(
             node,
             _paragraph_text(paragraph, text_budget, expansion_factor=5),
         )
+
+
+def _append_page_number_field(parent: ET.Element, run: PageNumberRun) -> None:
+    """Native ODF page-number field showing the current page (SAM-INLINE-PAGENUM-003)."""
+
+    number_format = run.number_style if run.number_style in {"1", "I", "i", "A", "a"} else "1"
+    attributes = {
+        _q("text", "select-page"): "current",
+        _q("style", "num-format"): number_format,
+    }
+    if number_format in {"A", "a"}:
+        attributes[_q("style", "num-letter-sync")] = "true"
+    field = ET.SubElement(parent, _q("text", "page-number"), attributes)
+    field.text = "1"
 
 
 def _frame_label(frame: Frame) -> str:
@@ -443,7 +477,63 @@ class _ContentBuilder:
             self.document.blocks,
             container_width_twips=self.geometry.body_width_twips,
         )
+        restart = document_page_number_restart(self.document.blocks)
+        if restart is not None:
+            self._bind_page_number_restart(restart)
         return _xml_bytes(root)
+
+    def _bind_page_number_restart(self, restart: int) -> None:
+        """Restart page numbering at *restart* from the first page.
+
+        ODF applies ``style:page-number`` only through a style that selects a master
+        page, so the first top-level paragraph's or table's one-use automatic style is
+        bound to the Standard master page (paragraphs inside tables would be ignored).
+        """
+
+        first = next(
+            (
+                child
+                for child in self.body_text
+                if child.tag in {_q("text", "p"), _q("text", "h"), _q("table", "table")}
+            ),
+            None,
+        )
+        if first is None or list(self.body_text).index(first) != 0:
+            self._paragraph_style_counter += 1
+            name = f"P{self._paragraph_style_counter}"
+            ET.SubElement(
+                self.automatic_styles,
+                _q("style", "style"),
+                {_q("style", "name"): name, _q("style", "family"): "paragraph"},
+            )
+            first = ET.Element(_q("text", "p"), {_q("text", "style-name"): name})
+            self.body_text.insert(0, first)
+        is_table = first.tag == _q("table", "table")
+        style_name = first.get(_q("table" if is_table else "text", "style-name"))
+        style = next(
+            (
+                node
+                for node in self.automatic_styles
+                if node.get(_q("style", "name")) == style_name
+            ),
+            None,
+        )
+        if style is None:
+            return
+        # Bind a one-use clone: a shared style (e.g. placeholders) carrying a master
+        # page would start a new page, and restart numbering, at every use.
+        self._paragraph_style_counter += 1
+        clone_name = f"P{self._paragraph_style_counter}R"
+        style = copy.deepcopy(style)
+        style.set(_q("style", "name"), clone_name)
+        self.automatic_styles.append(style)
+        first.set(_q("table" if is_table else "text", "style-name"), clone_name)
+        style.set(_q("style", "master-page-name"), "Standard")
+        tag = _q("style", "table-properties" if is_table else "paragraph-properties")
+        properties = style.find(tag)
+        if properties is None:
+            properties = ET.SubElement(style, tag)
+        properties.set(_q("style", "page-number"), str(restart))
 
     def _add_blocks(
         self,
@@ -704,7 +794,7 @@ class _ContentBuilder:
                 omitted = True
                 continue
             seen_runs.add(id(run))
-            value = run.text
+            value = run.leading_text if isinstance(run, PageNumberRun) else run.text
             if isinstance(value, bytes):
                 value = value.decode("utf-8", errors="replace")
             if not isinstance(value, str):
@@ -727,6 +817,8 @@ class _ContentBuilder:
                 {_q("text", "style-name"): self._text_style(effective)},
             )
             _append_text(span, value)
+            if isinstance(run, PageNumberRun):
+                _append_page_number_field(span, run)
             if total_characters >= 1_000_000:
                 omitted = True
                 break

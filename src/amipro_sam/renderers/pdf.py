@@ -10,9 +10,10 @@ toolkit to a fresh in-memory PNG before ReportLab sees it.
 
 from __future__ import annotations
 
+import functools
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from xml.sax.saxutils import escape
 
@@ -48,6 +49,7 @@ from reportlab.platypus import (
     Paragraph as ReportLabParagraph,
 )
 from reportlab.platypus import (
+    Flowable,
     SimpleDocTemplate,
     TableStyle,
 )
@@ -68,6 +70,7 @@ from ..model import (
     Image,
     PageBreak,
     PageLayout,
+    PageNumberRun,
     PageVariantGeometry,
     Paragraph,
     SdwDrawing,
@@ -79,6 +82,7 @@ from ..model import (
     TwipRect,
     UnsupportedObject,
     WmfGraphic,
+    page_number_text,
 )
 from ..sdw import SdwDecodeError, sdw_display_size, sdw_png, sdw_preview_caption
 from ..wmf import WmfDecodeError, wmf_display_size, wmf_png
@@ -877,7 +881,7 @@ def _page_furniture_callback(
         for block in furniture:
             if not _furniture_applies(block, page_number, page):
                 continue
-            lines = _furniture_lines(block, text_budget=text_budget)
+            lines = _furniture_lines(block, text_budget=text_budget, page_number=page_number)
             if not lines:
                 continue
             _draw_furniture(canvas, block, lines, page)
@@ -944,7 +948,7 @@ def _furniture_slots(block: Header | Footer, page: _PageSpec) -> set[str]:
 
 def _furniture_fits(block: Header | Footer, page: _PageSpec) -> bool:
     # Eligibility must not spend the output budget used for actual emission.
-    lines = _furniture_lines(block, text_budget=PdfTextBudget())
+    lines = _furniture_lines(block, text_budget=PdfTextBudget(), widest=True)
     if not lines:
         return False
     wrapped: list[str] = []
@@ -986,8 +990,65 @@ def _furniture_applies(
     return False
 
 
+@functools.lru_cache(maxsize=256)
+def _widest_page_number(
+    number_style: str, start_page: int, start_number: int, leading_text: str
+) -> str:
+    """Widest rendering of a page-number field over every reachable physical page."""
+
+    run = PageNumberRun(
+        text="",
+        number_style=number_style,
+        start_page=start_page,
+        start_number=start_number,
+        leading_text=leading_text,
+    )
+    candidates = (page_number_text(run, page) for page in range(1, _MAX_PDF_PAGES + 1))
+    return max(candidates, key=lambda value: unicode_line_width(value, "AmiProSans", 8.0))
+
+
+def _resolved_page_numbers(
+    paragraph: Paragraph, page_number: int | None, *, widest: bool = False
+) -> Paragraph:
+    """A copy of *paragraph* whose page-number fields are plain text for one page.
+
+    ``page_number=None`` keeps the placeholder unless ``widest`` asks for the widest
+    reachable rendering (used to reserve space before the page is known).
+    """
+
+    runs = paragraph.runs
+    if not isinstance(runs, list | tuple) or not any(
+        isinstance(run, PageNumberRun) for run in runs
+    ):
+        return paragraph
+    resolved: list[TextRun] = []
+    for run in runs:
+        if isinstance(run, PageNumberRun):
+            if page_number is not None:
+                text = page_number_text(run, page_number)
+            elif widest:
+                text = _widest_page_number(
+                    run.number_style, run.start_page, run.start_number, run.leading_text
+                )
+            else:
+                text = run.text
+            resolved.append(TextRun(text, run.style, run.source))
+        else:
+            resolved.append(run)
+    return replace(paragraph, runs=resolved)
+
+
+def _has_page_numbers(paragraph: object) -> bool:
+    runs = getattr(paragraph, "runs", None)
+    return isinstance(runs, list | tuple) and any(isinstance(run, PageNumberRun) for run in runs)
+
+
 def _furniture_lines(
-    block: Header | Footer, text_budget: PdfTextBudget | None = None
+    block: Header | Footer,
+    text_budget: PdfTextBudget | None = None,
+    *,
+    page_number: int | None = None,
+    widest: bool = False,
 ) -> list[str]:
     result: list[str] = []
     blocks = block.blocks
@@ -998,6 +1059,7 @@ def _furniture_lines(
     total_characters = 0
     text_budget = PdfTextBudget() if text_budget is None else text_budget
     for paragraph in blocks:
+        paragraph = _resolved_page_numbers(paragraph, page_number, widest=widest)
         value = _prepared_paragraph_text(paragraph, text_budget)
         if not isinstance(value, str) or len(value) > 4_096:
             return []
@@ -1057,6 +1119,30 @@ def _draw_furniture(
         canvas.restoreState()
 
 
+class _PageAwareFlowable(Flowable):
+    """Reserves space for the widest page number, then draws the real one.
+
+    In-flow page-number fields (non-promoted furniture) only know their page at draw
+    time, so the paragraph is rebuilt in ``draw`` from ``canv.getPageNumber()``.
+    """
+
+    def __init__(self, build, text_budget: PdfTextBudget) -> None:
+        super().__init__()
+        self._build = build
+        self._reserve = build(None, text_budget)
+        self._available = (0.0, 0.0)
+
+    def wrap(self, available_width: float, available_height: float) -> tuple[float, float]:
+        self._available = (available_width, available_height)
+        self.width, self.height = self._reserve.wrap(available_width, available_height)
+        return self.width, self.height
+
+    def draw(self) -> None:
+        flowable = self._build(self.canv.getPageNumber(), PdfTextBudget())
+        _width, height = flowable.wrap(*self._available)
+        flowable.drawOn(self.canv, 0, self.height - height)
+
+
 def _is_reportlab_layout_failure(error: BaseException) -> bool:
     if isinstance(error, LayoutError):
         return True
@@ -1093,6 +1179,20 @@ def _paragraph_flowable(
     fallback_alignment: str | None = None,
 ) -> object:
     text_budget = PdfTextBudget() if text_budget is None else text_budget
+    if _has_page_numbers(paragraph):
+
+        def build(page_number: int | None, budget: PdfTextBudget) -> object:
+            return _paragraph_flowable(
+                document,
+                _resolved_page_numbers(paragraph, page_number, widest=True),
+                marker=marker,
+                force_bold=force_bold,
+                text_budget=budget,
+                container_width_twips=container_width_twips,
+                fallback_alignment=fallback_alignment,
+            )
+
+        return _PageAwareFlowable(build, text_budget)
     style_definition = _resolved_style(document, paragraph.style_name)
     base_character = style_definition.character if style_definition else CharacterStyle()
     if force_bold:

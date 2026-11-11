@@ -290,6 +290,126 @@ class TextRun:
     source: SourceSpan | None = None
 
 
+PAGE_NUMBER_PLACEHOLDER = "[#]"
+
+
+@dataclass(slots=True)
+class PageNumberRun(TextRun):
+    """An Ami Pro page-number field (SAM-INLINE-PAGENUM-001..004).
+
+    ``text`` holds the leading text plus a placeholder so that consumers that only
+    read text stay readable; paginated renderers call :func:`page_number_text`.
+    """
+
+    number_style: str = "1"
+    start_page: int = 0
+    start_number: int = 0
+    leading_text: str = ""
+
+
+_ROMAN = (
+    (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+    (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+)
+
+
+def format_page_number(value: int, number_style: str) -> str:
+    """Format a page number in an Ami Pro style (``1 I i A a``).
+
+    Roman numerals above 3999 and non-positive values fall back to arabic; letters
+    continue ``z, aa, bb`` like ODF ``num-letter-sync``.
+    """
+
+    if value < 1 or number_style == "1":
+        return str(value)
+    if number_style in ("I", "i") and value <= 3999:
+        parts = []
+        remaining = value
+        for amount, symbol in _ROMAN:
+            count, remaining = divmod(remaining, amount)
+            parts.append(symbol * count)
+        roman = "".join(parts)
+        return roman if number_style == "I" else roman.lower()
+    if number_style in ("A", "a"):
+        letter = chr(ord(number_style) + (value - 1) % 26)
+        return letter * ((value - 1) // 26 + 1)
+    return str(value)
+
+
+def page_number_value(run: PageNumberRun, physical_page: int) -> int | None:
+    """The number shown on *physical_page*, or None before the start page."""
+
+    if run.start_page and physical_page < run.start_page:
+        return None
+    if run.start_number > 0:
+        if run.start_page == 0:
+            return physical_page + run.start_number - 1
+        return physical_page - run.start_page + run.start_number
+    return physical_page
+
+
+def page_number_text(run: PageNumberRun, physical_page: int) -> str:
+    """Leading text plus the formatted number for *physical_page* ("" before the start)."""
+
+    value = page_number_value(run, physical_page)
+    if value is None:
+        return ""
+    return run.leading_text + format_page_number(value, run.number_style)
+
+
+_PAGE_NUMBER_WALK_LIMIT = 100_000
+
+
+def page_number_runs(blocks: object) -> list[PageNumberRun]:
+    """All page-number fields under *blocks* (paragraphs, containers, table cells), bounded."""
+
+    found: list[PageNumberRun] = []
+    stack: list[object] = [blocks]
+    visited = 0
+    seen: set[int] = set()
+    while stack and visited < _PAGE_NUMBER_WALK_LIMIT:
+        current = stack.pop()
+        visited += 1
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, list | tuple):
+            stack.extend(reversed(current[:4_096]))
+            continue
+        runs = getattr(current, "runs", None)
+        if isinstance(runs, list | tuple):
+            found.extend(run for run in runs[:4_096] if isinstance(run, PageNumberRun))
+        for name in ("blocks", "rows", "cells"):
+            child = getattr(current, name, None)
+            if isinstance(child, list | tuple):
+                stack.append(child)
+    return found
+
+
+def document_page_number_restart(blocks: object) -> int | None:
+    """One numbering restart value that expresses every field, else None.
+
+    None also when there are no fields or the restart would be 1 (ordinary numbering).
+    """
+
+    values = {page_number_restart(run) for run in page_number_runs(blocks)}
+    if len(values) != 1:
+        return None
+    (value,) = values
+    return value if value not in (None, 1) else None
+
+
+def page_number_restart(run: PageNumberRun) -> int | None:
+    """Value shown on physical page 1 when a numbering restart can express the field.
+
+    None when it cannot (start page beyond 1, i.e. numbers hidden on early pages).
+    """
+
+    if run.start_page > 1:
+        return None
+    return run.start_number if run.start_number > 0 else 1
+
+
 @dataclass(slots=True)
 class Paragraph:
     runs: list[TextRun] = field(default_factory=list)

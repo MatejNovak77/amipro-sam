@@ -76,11 +76,13 @@ def test_font_family_escape_decoded_in_codepage() -> None:
 
 
 def test_nested_page_number_field_is_one_command() -> None:
-    document = parse_bytes(_sam("<:P1,1,1,Str<\\a>nka >TAIL"))
-    text = "".join(p.text for p in _paragraphs(document))
+    # A valid field (SAM-INLINE-PAGENUM-001) whose leading text holds an escape: the
+    # escape's ">" must not close the command, so no tail leaks into the text.
+    document = parse_bytes(_sam("<:P11,1,Str<\\a>nka >TAIL"))
+    (paragraph,) = _paragraphs(document)
 
-    assert "nka" not in text
-    assert text.endswith("TAIL")
+    assert paragraph.text == "Stránka [#]TAIL"
+    assert "inline-command-boundary-fallback" not in _codes(document)
 
 
 def test_unterminated_nested_command_falls_back() -> None:

@@ -25,6 +25,7 @@ from ..model import (
     Header,
     Image,
     PageBreak,
+    PageNumberRun,
     Paragraph,
     SdwDrawing,
     StyleDefinition,
@@ -36,6 +37,7 @@ from ..model import (
     WmfGraphic,
     _paragraph_text,
     _TextOutputBudget,
+    document_page_number_restart,
 )
 from ..model import Document as AmiProDocument
 from ..sdw import SdwDecodeError, sdw_display_size, sdw_png, sdw_preview_caption
@@ -390,6 +392,10 @@ def render(
             show_structure_labels=show_structure_labels,
         )
 
+        restart = document_page_number_restart(document.blocks)
+        if restart is not None:
+            _set_page_number_restart(section, restart)
+
         buffer = BytesIO()
         output_document.save(buffer)
         return _sanitize_package(buffer.getvalue())
@@ -565,11 +571,84 @@ def _populate_native_container(
         target = existing[0] if index == 0 and existing else container.add_paragraph()
         _clear_word_paragraph(target)
         if isinstance(source, Paragraph):
+            runs = source.runs
+            if isinstance(runs, list | tuple) and any(
+                isinstance(run, PageNumberRun) for run in runs
+            ):
+                for run in runs[:1_024]:
+                    if not isinstance(run, TextRun):
+                        continue
+                    piece = run.leading_text if isinstance(run, PageNumberRun) else run.text
+                    target.add_run(
+                        _clean_xml_text(
+                            _paragraph_text(
+                                Paragraph(runs=[TextRun(piece)]),
+                                text_budget,
+                                expansion_factor=5,
+                            )
+                        )
+                    )
+                    if isinstance(run, PageNumberRun):
+                        _append_page_field(target, run)
+                continue
             target.add_run(
                 _clean_xml_text(
                     _paragraph_text(source, text_budget, expansion_factor=5)
                 )
             )
+
+
+_PAGE_FIELD_SWITCHES = {
+    "1": "",
+    "I": " \\* ROMAN",
+    "i": " \\* roman",
+    "A": " \\* ALPHABETIC",
+    "a": " \\* alphabetic",
+}
+
+
+def _append_page_field(paragraph: Any, run: PageNumberRun) -> None:
+    """Append a native PAGE field (current page number) in the field's style."""
+
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    switch = _PAGE_FIELD_SWITCHES.get(run.number_style, "")
+    field = OxmlElement("w:fldSimple")
+    field.set(qn("w:instr"), f" PAGE{switch} ")
+    result_run = OxmlElement("w:r")
+    result_text = OxmlElement("w:t")
+    result_text.text = "1"
+    result_run.append(result_text)
+    field.append(result_run)
+    paragraph._p.append(field)
+
+
+def _set_page_number_restart(section: Any, restart: int) -> None:
+    """Restart the section's page numbering at *restart* (w:pgNumType/@w:start)."""
+
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    properties = section._sectPr
+    number_type = properties.find(qn("w:pgNumType"))
+    if number_type is None:
+        number_type = OxmlElement("w:pgNumType")
+        # CT_SectPr is a sequence: pgNumType precedes cols, docGrid and later children.
+        later = {
+            qn(name)
+            for name in (
+                "w:cols", "w:formProt", "w:vAlign", "w:noEndnote", "w:titlePg",
+                "w:textDirection", "w:bidi", "w:rtlGutter", "w:docGrid",
+                "w:printerSettings", "w:sectPrChange",
+            )
+        }
+        successor = next((child for child in properties if child.tag in later), None)
+        if successor is None:
+            properties.append(number_type)
+        else:
+            successor.addprevious(number_type)
+    number_type.set(qn("w:start"), str(restart))
 
 
 def _clear_word_paragraph(paragraph: Any) -> None:
@@ -765,7 +844,11 @@ def _populate_paragraph(
             omitted = True
             continue
         seen_runs.add(id(source_run))
-        value = source_run.text
+        value = (
+            source_run.leading_text
+            if isinstance(source_run, PageNumberRun)
+            else source_run.text
+        )
         if isinstance(value, bytes):
             value = value.decode("utf-8", errors="replace")
         if not isinstance(value, str):
@@ -783,6 +866,8 @@ def _populate_paragraph(
             omitted = True
         run = target.add_run(_clean_xml_text(value))
         _format_run(run, _merge_character_style(base, source_run.style))
+        if isinstance(source_run, PageNumberRun):
+            _append_page_field(target, source_run)
         if total_characters >= 1_000_000:
             omitted = True
             break

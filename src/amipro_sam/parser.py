@@ -18,6 +18,7 @@ from .decoding import DecodedSource, decode_bytes
 from .errors import ParseError, PreservationLossError, ResourceLimitError
 from .limits import ParseLimits
 from .model import (
+    PAGE_NUMBER_PLACEHOLDER,
     Annotation,
     Block,
     CharacterStyle,
@@ -32,6 +33,7 @@ from .model import (
     OpaquePageHints,
     PageBreak,
     PageLayout,
+    PageNumberRun,
     PageVariantGeometry,
     Paragraph,
     SdwDrawing,
@@ -49,6 +51,8 @@ from .model import (
     UnknownRecord,
     UnsupportedObject,
     WmfGraphic,
+    page_number_restart,
+    page_number_runs,
 )
 from .model import Diagnostic as _DiagnosticRecord
 from .sdw import SdwDecodeError, decode_sdw_preview, sdw_asset_limit, validate_sdw
@@ -223,6 +227,7 @@ class _InlineState:
     page_break_before: bool = False
     page_break_after: bool = False
     page_break_requested: bool = False
+    page_number_run: PageNumberRun | None = None
     unknown_tags: list[str] = field(default_factory=list)
     unapplied_tags: list[str] = field(default_factory=list)
     open_dynamic_fields: list[str] = field(default_factory=list)
@@ -542,6 +547,17 @@ def parse_bytes(
     _diagnose_unindexed_tail(document, data, decoded)
 
     _record_unknown_main_sections(document, sections)
+    field_restarts = {page_number_restart(run) for run in page_number_runs(document.blocks)}
+    if None in field_restarts or len(field_restarts) > 1:
+        document.diagnostics.append(
+            Diagnostic(
+                Severity.WARNING,
+                "page-number-offset-unsupported",
+                "page-number fields need numbering that a single restart cannot express "
+                "(start page beyond 1 or differing offsets); ODT/DOCX show plain page numbers",
+                lossiness=Lossiness.SEMANTIC,
+            )
+        )
     if escape_codec is not None:
         document.diagnostics.extend(escape_codec.diagnostics())
     if strict and document.preservation_losses:
@@ -4161,6 +4177,15 @@ def _parse_inline_paragraph(
                             state.page_break_before = break_before
                             state.page_break_after = True
                             visible_at_break = count
+                    if state.page_number_run is not None:
+                        field_run = state.page_number_run
+                        state.page_number_run = None
+                        finish_run()
+                        field_run.style = copy.copy(state.style)
+                        field_run.source = source
+                        if record_budget is not None:
+                            record_budget.charge(1, record_label)
+                        paragraph.runs.append(field_run)
                     if visible:
                         buffer.append(visible)
                 index = end + 1
@@ -4500,8 +4525,19 @@ def _apply_inline_tag(
         state.unknown_tags.append(tag[:200])
         return "[Current date]"
     if tag.startswith(":P"):
-        state.unknown_tags.append(tag[:200])
-        return "[Page number]"
+        field_match = _PAGE_NUMBER_FORM.match(tag)
+        leading = _unescape_literal(field_match.group(4)) if field_match else ""
+        if field_match is None or len(leading) > _MAX_PAGE_NUMBER_LEADING:
+            state.unknown_tags.append(tag[:200])
+            return _unsupported_inline_marker(tag)
+        state.page_number_run = PageNumberRun(
+            text=leading + PAGE_NUMBER_PLACEHOLDER,
+            number_style=field_match.group(1),
+            start_page=int(field_match.group(2)),
+            start_number=int(field_match.group(3)),
+            leading_text=leading,
+        )
+        return None
     if re.match(r"^:[NFHh]", tag):
         state.unknown_tags.append(tag[:200])
         return f"[Unsupported multiline record: <{tag[:200]}>]"
@@ -4528,6 +4564,8 @@ def _escape_character(kind: str, operand: str) -> str | None:
 
 
 _MAX_NESTED_INLINE_COMMAND_CHARS = 512
+_PAGE_NUMBER_FORM = re.compile(r"^:P([1IiAa])(\d{1,4}),(\d{1,4}),(.*)$", re.DOTALL)
+_MAX_PAGE_NUMBER_LEADING = 255
 _PAGE_BREAK_FORM = re.compile(r"^:p(<\*.>|</.>|<\\.>|[^<>])(.*)$", re.DOTALL)
 
 
