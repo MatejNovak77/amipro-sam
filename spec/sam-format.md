@@ -144,9 +144,11 @@ code page is preserved as the surrogate U+DC00 + byte and reported once per docu
 as `escape-byte-undefined` (content loss). When the selected encoding is not a
 single-byte code page (UTF-8/16/32, double-byte Asian code pages), escaped bytes are
 decoded as CP1252, the Ami Pro Western default, and reported once as
-`escape-codepage-fallback` (semantic loss). Escapes inside inline commands (for example
-a family name in `<:f...>`) are not yet decoded, because command boundaries are not
-escape-aware.
+`escape-codepage-fallback` (semantic loss). Escapes inside inline commands (for example a
+family name in `<:f...>`) are decoded too: complete escape tokens inside a command
+payload do not close it (`SAM-INLINE-NESTING-001`). The reader scans at most 512
+characters for the close; past that, or at the end of the text after a nested token, it
+keeps the first `>` and reports `inline-command-boundary-fallback` (semantic loss).
 
 ## 6. Inline command registry
 
@@ -184,7 +186,8 @@ those rendering dimensions remain open until isolated by the native oracle.
 | `<:>` | no payload | Restore current style character state | grammar confirmed; meaning strong; native behavior open, `SAM-INLINE-CONTROL-001` |
 | `<:s>` | no payload | Nonprinting spelling state | grammar confirmed; meaning strong; native behavior open, `SAM-INLINE-CONTROL-001` |
 | `<:p>` | no payload | Page break before following visible paragraph | grammar confirmed; meaning strong; native pagination open, `SAM-INLINE-CONTROL-001` |
-| `<:p...>` | noncanonical payload | Retain as an unsupported variant; do not infer payload semantics | syntax strong, payload open, `SAM-INLINE-CONTROL-001` |
+| `<:pFLAG[NAME]>` | one flag byte (raw or escaped, e.g. `<* >` = 0, `@` = 64, `</@>` = 128) and a layout name only for 128 | Page break; the following text starts the next page. Flags other than 0 are recorded as unapplied (`inline-command-semantics-unapplied`); a break with text after it in the same paragraph is approximated after the paragraph (`page-break-mid-paragraph-approximated`) | grammar confirmed; flag meanings confirmed/strong; placement tentative, `SAM-INLINE-PAGEBREAK-001`, `SAM-INLINE-PAGEBREAK-002` |
+| `<:p...>` | other payload | Retain as an unsupported variant; do not infer payload semantics | syntax strong, payload open, `SAM-INLINE-CONTROL-001` |
 
 ### 6.2 Geometry, anchors, and dynamic content
 
